@@ -72,37 +72,48 @@ use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::FutureExt;
+use std::future::Future;
 use std::mem;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// The asynchronous interface used by [`AsyncArrowWriter`] to write parquet files.
-pub trait AsyncFileWriter: Send {
+pub trait AsyncFileWriter<'a> {
+    /// Future returned by `write`
+    type Fut: Future<Output = Result<()>> + 'a;
+
     /// Write the provided bytes to the underlying writer
     ///
     /// The underlying writer CAN decide to buffer the data or write it immediately.
     /// This design allows the writer implementer to control the buffering and I/O scheduling.
     ///
     /// The underlying writer MAY implement retry logic to prevent breaking users write process.
-    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<()>>;
+    fn write(&'a mut self, bs: Bytes) -> Self::Fut;
 
     /// Flush any buffered data to the underlying writer and finish writing process.
     ///
     /// After `complete` returns `Ok(())`, caller SHOULD not call write again.
-    fn complete(&mut self) -> BoxFuture<'_, Result<()>>;
+    fn complete(&'a mut self) -> Self::Fut;
 }
 
-impl AsyncFileWriter for Box<dyn AsyncFileWriter + '_> {
-    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<()>> {
+impl<'a, F> AsyncFileWriter<'a> for Box<dyn AsyncFileWriter<'a, Fut = F> + '_>
+where
+    F: Future<Output = Result<()>> + 'a,
+{
+    type Fut = F;
+
+    fn write(&'a mut self, bs: Bytes) -> Self::Fut {
         self.as_mut().write(bs)
     }
 
-    fn complete(&mut self) -> BoxFuture<'_, Result<()>> {
+    fn complete(&'a mut self) -> Self::Fut {
         self.as_mut().complete()
     }
 }
 
-impl<T: AsyncWrite + Unpin + Send> AsyncFileWriter for T {
-    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<()>> {
+impl<'a, T: AsyncWrite + Unpin + Send> AsyncFileWriter<'a> for T {
+    type Fut = BoxFuture<'a, Result<()>>;
+
+    fn write(&'a mut self, bs: Bytes) -> Self::Fut {
         async move {
             self.write_all(&bs).await?;
             Ok(())
@@ -110,7 +121,7 @@ impl<T: AsyncWrite + Unpin + Send> AsyncFileWriter for T {
         .boxed()
     }
 
-    fn complete(&mut self) -> BoxFuture<'_, Result<()>> {
+    fn complete(&'a mut self) -> Self::Fut {
         async move {
             self.flush().await?;
             self.shutdown().await?;
@@ -156,7 +167,7 @@ pub struct AsyncArrowWriter<W> {
     async_writer: W,
 }
 
-impl<W: AsyncFileWriter> AsyncArrowWriter<W> {
+impl<W: for<'a> AsyncFileWriter<'a>> AsyncArrowWriter<W> {
     /// Try to create a new Async Arrow Writer
     pub fn try_new(
         writer: W,

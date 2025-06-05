@@ -92,8 +92,10 @@ impl ParquetObjectWriter {
     }
 }
 
-impl AsyncFileWriter for ParquetObjectWriter {
-    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<()>> {
+impl<'a> AsyncFileWriter<'a> for ParquetObjectWriter {
+    type Fut = BoxFuture<'a, Result<()>>;
+
+    fn write(&'a mut self, bs: Bytes) -> Self::Fut {
         Box::pin(async {
             self.w
                 .put(bs)
@@ -102,7 +104,7 @@ impl AsyncFileWriter for ParquetObjectWriter {
         })
     }
 
-    fn complete(&mut self) -> BoxFuture<'_, Result<()>> {
+    fn complete(&'a mut self) -> Self::Fut {
         Box::pin(async {
             self.w
                 .shutdown()
