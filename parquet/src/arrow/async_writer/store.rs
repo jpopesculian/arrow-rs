@@ -17,15 +17,47 @@
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use std::fmt;
+use std::mem;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use crate::arrow::async_writer::AsyncFileWriter;
 use crate::errors::{ParquetError, Result};
+use futures::prelude::*;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use object_store::ObjectStore;
+use pin_project_lite::pin_project;
 use tokio::io::AsyncWriteExt;
 
+enum ParquetObjectWriterState {
+    Ready(Box<BufWriter>),
+    Writing(BoxFuture<'static, (BufWriter, Result<()>)>),
+    ShuttingDown(BoxFuture<'static, (BufWriter, Result<()>)>),
+    Invalid,
+}
+
+impl ParquetObjectWriterState {
+    fn new(w: BufWriter) -> Self {
+        Self::Ready(Box::new(w))
+    }
+}
+
+impl fmt::Debug for ParquetObjectWriterState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use ParquetObjectWriterState::*;
+        match self {
+            Ready(w) => w.fmt(f),
+            Writing(_) => write!(f, "Writing"),
+            ShuttingDown(_) => write!(f, "ShuttingDown"),
+            Invalid => write!(f, "Invalid"),
+        }
+    }
+}
+
+pin_project! {
 /// [`ParquetObjectWriter`] for writing to parquet to [`ObjectStore`]
 ///
 /// ```
@@ -70,7 +102,8 @@ use tokio::io::AsyncWriteExt;
 /// ```
 #[derive(Debug)]
 pub struct ParquetObjectWriter {
-    w: BufWriter,
+    state: ParquetObjectWriterState,
+}
 }
 
 impl ParquetObjectWriter {
@@ -83,32 +116,143 @@ impl ParquetObjectWriter {
 
     /// Construct a new ParquetObjectWriter via a existing BufWriter.
     pub fn from_buf_writer(w: BufWriter) -> Self {
-        Self { w }
+        Self {
+            state: ParquetObjectWriterState::new(w),
+        }
+    }
+
+    /// Take ownership of the underlying BufWriter. This will mut the writer in an invalid state.
+    ///
+    /// This will throw an error if the current state is invalid or unavailable
+    pub fn take(&mut self) -> Result<BufWriter> {
+        use ParquetObjectWriterState::*;
+        match mem::replace(&mut self.state, ParquetObjectWriterState::Invalid) {
+            Ready(w) => Ok(*w),
+            Writing(fut) => {
+                self.state = Writing(fut);
+                Err(ParquetError::General(
+                    "Cannot consume writer while it is writing".into(),
+                ))
+            }
+            ShuttingDown(fut) => {
+                self.state = ShuttingDown(fut);
+                Err(ParquetError::General(
+                    "Cannot consume writer while it is shutting down".into(),
+                ))
+            }
+            Invalid => Err(ParquetError::General("Writer in invalid state".into())),
+        }
     }
 
     /// Consume the writer and return the underlying BufWriter.
-    pub fn into_inner(self) -> BufWriter {
-        self.w
+    ///
+    /// This will throw an error if the current state is invalid or unavailable
+    pub fn into_inner(mut self) -> Result<BufWriter> {
+        self.take()
     }
 }
 
 impl AsyncFileWriter for ParquetObjectWriter {
-    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async {
-            self.w
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, bs: Bytes) -> Poll<Result<()>> {
+        use ParquetObjectWriterState::*;
+        let this = self.project();
+        let mut w = match mem::replace(this.state, ParquetObjectWriterState::Invalid) {
+            Ready(w) => *w,
+            Writing(mut fut) => match fut.as_mut().poll(cx) {
+                Poll::Ready((w, res)) => {
+                    *this.state = Ready(Box::new(w));
+                    return Poll::Ready(res);
+                }
+                Poll::Pending => {
+                    *this.state = Writing(fut);
+                    return Poll::Pending;
+                }
+            },
+            ShuttingDown(mut fut) => match fut.as_mut().poll(cx) {
+                Poll::Ready((w, res)) => match res {
+                    Ok(()) => w,
+                    Err(err) => {
+                        return Poll::Ready(Err(err));
+                    }
+                },
+                Poll::Pending => {
+                    *this.state = ShuttingDown(fut);
+                    return Poll::Pending;
+                }
+            },
+            Invalid => {
+                return Poll::Ready(Err(ParquetError::General("Writer in invalid state".into())));
+            }
+        };
+        let mut fut = async move {
+            let res = w
                 .put(bs)
                 .await
-                .map_err(|err| ParquetError::External(Box::new(err)))
-        })
+                .map_err(|err| ParquetError::External(Box::new(err)));
+            (w, res)
+        }
+        .boxed();
+        match fut.as_mut().poll(cx) {
+            Poll::Ready((w, res)) => {
+                *this.state = Ready(Box::new(w));
+                Poll::Ready(res)
+            }
+            Poll::Pending => {
+                *this.state = Writing(fut);
+                Poll::Pending
+            }
+        }
     }
 
-    fn complete(&mut self) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async {
-            self.w
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        use ParquetObjectWriterState::*;
+        let this = self.project();
+        let mut w = match mem::replace(this.state, ParquetObjectWriterState::Invalid) {
+            Ready(w) => *w,
+            Writing(mut fut) => match fut.as_mut().poll(cx) {
+                Poll::Ready((w, res)) => match res {
+                    Ok(()) => w,
+                    Err(err) => {
+                        return Poll::Ready(Err(err));
+                    }
+                },
+                Poll::Pending => {
+                    *this.state = Writing(fut);
+                    return Poll::Pending;
+                }
+            },
+            ShuttingDown(mut fut) => match fut.as_mut().poll(cx) {
+                Poll::Ready((w, res)) => {
+                    *this.state = Ready(Box::new(w));
+                    return Poll::Ready(res);
+                }
+                Poll::Pending => {
+                    *this.state = ShuttingDown(fut);
+                    return Poll::Pending;
+                }
+            },
+            Invalid => {
+                return Poll::Ready(Err(ParquetError::General("Writer in invalid state".into())));
+            }
+        };
+        let mut fut = async move {
+            let res = w
                 .shutdown()
                 .await
-                .map_err(|err| ParquetError::External(Box::new(err)))
-        })
+                .map_err(|err| ParquetError::External(Box::new(err)));
+            (w, res)
+        }
+        .boxed();
+        match fut.as_mut().poll(cx) {
+            Poll::Ready((w, res)) => {
+                *this.state = Ready(Box::new(w));
+                Poll::Ready(res)
+            }
+            Poll::Pending => {
+                *this.state = ShuttingDown(fut);
+                Poll::Pending
+            }
+        }
     }
 }
 impl From<BufWriter> for ParquetObjectWriter {

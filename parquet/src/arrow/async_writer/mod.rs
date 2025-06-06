@@ -70,53 +70,161 @@ use crate::{
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use bytes::Bytes;
-use futures::future::BoxFuture;
-use futures::FutureExt;
+use pin_project_lite::pin_project;
+use std::future::Future;
 use std::mem;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use std::pin::Pin;
+use std::task::{ready, Context, Poll};
+use tokio::io::AsyncWrite;
 
 /// The asynchronous interface used by [`AsyncArrowWriter`] to write parquet files.
-pub trait AsyncFileWriter: Send {
+pub trait AsyncFileWriter {
     /// Write the provided bytes to the underlying writer
     ///
     /// The underlying writer CAN decide to buffer the data or write it immediately.
     /// This design allows the writer implementer to control the buffering and I/O scheduling.
     ///
     /// The underlying writer MAY implement retry logic to prevent breaking users write process.
-    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<()>>;
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, bs: Bytes) -> Poll<Result<()>>;
 
     /// Flush any buffered data to the underlying writer and finish writing process.
     ///
     /// After `complete` returns `Ok(())`, caller SHOULD not call write again.
-    fn complete(&mut self) -> BoxFuture<'_, Result<()>>;
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>>;
 }
 
-impl AsyncFileWriter for Box<dyn AsyncFileWriter + '_> {
-    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<()>> {
-        self.as_mut().write(bs)
-    }
+pin_project! {
+/// A future to write [`Bytes`] to an [`AsyncFileWriter`].
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Write<'a, W: ?Sized> {
+    writer: &'a mut W,
+    bs: Bytes,
+}
+}
 
-    fn complete(&mut self) -> BoxFuture<'_, Result<()>> {
-        self.as_mut().complete()
+impl<W> Future for Write<'_, W>
+where
+    W: AsyncFileWriter + Unpin,
+{
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        Pin::new(&mut *this.writer).poll_write(cx, this.bs.clone())
     }
 }
 
-impl<T: AsyncWrite + Unpin + Send> AsyncFileWriter for T {
-    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<()>> {
-        async move {
-            self.write_all(&bs).await?;
-            Ok(())
-        }
-        .boxed()
+pin_project! {
+/// A future to complete an [`AsyncFileWriter`].
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Complete<'a, W: ?Sized> {
+    writer: &'a mut W,
+}
+}
+
+impl<W> Future for Complete<'_, W>
+where
+    W: AsyncFileWriter + Unpin,
+{
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        Pin::new(&mut *this.writer).poll_complete(cx)
+    }
+}
+
+trait AsyncFileWriterExt {
+    fn write(&mut self, bs: Bytes) -> Write<'_, Self>;
+
+    fn complete(&mut self) -> Complete<'_, Self>;
+}
+
+impl<T> AsyncFileWriterExt for T
+where
+    T: AsyncFileWriter + Unpin,
+{
+    fn write(&mut self, bs: Bytes) -> Write<'_, Self> {
+        Write { writer: self, bs }
     }
 
-    fn complete(&mut self) -> BoxFuture<'_, Result<()>> {
-        async move {
-            self.flush().await?;
-            self.shutdown().await?;
-            Ok(())
+    fn complete(&mut self) -> Complete<'_, Self> {
+        Complete { writer: self }
+    }
+}
+
+impl<T: ?Sized + AsyncFileWriter + Unpin> AsyncFileWriter for Box<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bs: Bytes) -> Poll<Result<()>> {
+        Pin::new(&mut **self).poll_write(cx, bs)
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut **self).poll_complete(cx)
+    }
+}
+
+impl<T: ?Sized + AsyncFileWriter + Unpin> AsyncFileWriter for &mut T {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bs: Bytes) -> Poll<Result<()>> {
+        Pin::new(&mut **self).poll_write(cx, bs)
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut **self).poll_complete(cx)
+    }
+}
+
+pin_project! {
+    /// A generic async file writer that implements [`AsyncFileWriter`]
+    ///
+    /// This struct can be used to wrap any type that implements [`AsyncWrite`] and
+    /// provides the necessary methods to write bytes and complete the write operation.
+    ///
+    /// It is useful for creating a custom async file writer that can be used with
+    /// [`AsyncArrowWriter`].
+    #[derive(Debug)]
+    pub struct GenericAsyncFileWriter<T> {
+        #[pin]
+        writer: T,
+        flushed: bool,
+        closed: bool,
+    }
+}
+
+impl<T> GenericAsyncFileWriter<T> {
+    /// Create a new [`GenericAsyncFileWriter`] from the provided writer
+    pub fn new(writer: T) -> Self {
+        Self {
+            writer,
+            flushed: false,
+            closed: false,
         }
-        .boxed()
+    }
+}
+
+impl<T: AsyncWrite> AsyncFileWriter for GenericAsyncFileWriter<T> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, bs: Bytes) -> Poll<Result<()>> {
+        if let Err(err) = ready!(self.project().writer.poll_write(cx, &bs)) {
+            return Poll::Ready(Err(err.into()));
+        };
+        Poll::Ready(Ok(()))
+    }
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let mut this = self.project();
+        if !*this.flushed {
+            match ready!(this.writer.as_mut().poll_flush(cx)) {
+                Ok(_) => *this.flushed = true,
+                Err(err) => return Poll::Ready(Err(err.into())),
+            }
+        }
+        if !*this.closed {
+            match ready!(this.writer.as_mut().poll_shutdown(cx)) {
+                Ok(_) => *this.closed = true,
+                Err(err) => return Poll::Ready(Err(err.into())),
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -156,7 +264,7 @@ pub struct AsyncArrowWriter<W> {
     async_writer: W,
 }
 
-impl<W: AsyncFileWriter> AsyncArrowWriter<W> {
+impl<W: AsyncFileWriter + Unpin> AsyncArrowWriter<W> {
     /// Try to create a new Async Arrow Writer
     pub fn try_new(
         writer: W,
@@ -309,7 +417,12 @@ mod tests {
         let to_write = RecordBatch::try_from_iter([("col", col)]).unwrap();
 
         let mut buffer = Vec::new();
-        let mut writer = AsyncArrowWriter::try_new(&mut buffer, to_write.schema(), None).unwrap();
+        let mut writer = AsyncArrowWriter::try_new(
+            GenericAsyncFileWriter::new(&mut buffer),
+            to_write.schema(),
+            None,
+        )
+        .unwrap();
         writer.write(&to_write).await.unwrap();
         writer.close().await.unwrap();
 
@@ -335,7 +448,7 @@ mod tests {
 
         let mut async_buffer = Vec::new();
         let mut async_writer = AsyncArrowWriter::try_new(
-            &mut async_buffer,
+            GenericAsyncFileWriter::new(&mut async_buffer),
             reader.schema(),
             Some(write_props.clone()),
         )
@@ -406,9 +519,12 @@ mod tests {
         let temp = tempfile::tempfile().unwrap();
 
         let file = tokio::fs::File::from_std(temp.try_clone().unwrap());
-        let mut writer =
-            AsyncArrowWriter::try_new(file.try_clone().await.unwrap(), to_write.schema(), None)
-                .unwrap();
+        let mut writer = AsyncArrowWriter::try_new(
+            GenericAsyncFileWriter::new(file.try_clone().await.unwrap()),
+            to_write.schema(),
+            None,
+        )
+        .unwrap();
         writer.write(&to_write).await.unwrap();
         let _metadata = writer.finish().await.unwrap();
         // After `finish` this should include the metadata and footer
@@ -433,7 +549,9 @@ mod tests {
         let temp = tempfile::tempfile().unwrap();
 
         let file = tokio::fs::File::from_std(temp.try_clone().unwrap());
-        let mut writer = AsyncArrowWriter::try_new(file, to_write.schema(), None).unwrap();
+        let mut writer =
+            AsyncArrowWriter::try_new(GenericAsyncFileWriter::new(file), to_write.schema(), None)
+                .unwrap();
         writer.write(&to_write).await.unwrap();
         writer.close().await.unwrap();
 
@@ -459,7 +577,9 @@ mod tests {
 
         let temp = tempfile::tempfile().unwrap();
         let file = tokio::fs::File::from_std(temp.try_clone().unwrap());
-        let mut writer = AsyncArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        let mut writer =
+            AsyncArrowWriter::try_new(GenericAsyncFileWriter::new(file), batch.schema(), None)
+                .unwrap();
 
         // starts empty
         assert_eq!(writer.in_progress_size(), 0);
